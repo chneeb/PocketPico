@@ -368,8 +368,17 @@ static void pio_wait_idle()
 {
     uint32_t stall_mask = 1u << (spi_sm + PIO_FDEBUG_TXSTALL_LSB);
     spi_pio->fdebug = stall_mask;
+    uint64_t deadline = time_us_64() + 2000000; // 2s timeout
     while (!(spi_pio->fdebug & stall_mask))
     {
+        if (time_us_64() > deadline)
+        {
+            printf("PWI TIMEOUT fdebug=%08x fstat=%08x sm_ctrl=%08x\n",
+                   (unsigned)spi_pio->fdebug, (unsigned)spi_pio->fstat,
+                   (unsigned)spi_pio->sm[spi_sm].execctrl);
+            stdio_flush();
+            break;
+        }
     }
 }
 
@@ -442,7 +451,6 @@ void kbd_interrupt()
     {
         if (check_if_failed() > 0)
         {
-            printf("try to reset i2c\n");
             reset_failed();
             init_i2c_kbd(); // re-init
         }

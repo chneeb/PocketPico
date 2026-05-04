@@ -45,7 +45,7 @@ target_link_libraries(PocketPico
         FatFs_SPI
         pico_stdlib pico_stdio pico_bootrom pico_multicore pico_multicore
         hardware_clocks hardware_pio hardware_vreg hardware_pio hardware_flash
-        hardware_sync hardware_pll hardware_spi hardware_irq hardware_dma
+        hardware_xip_cache hardware_sync hardware_pll hardware_spi hardware_irq hardware_dma
         pico_binary_info ili9488_p audio)
         
 target_compile_definitions(PocketPico PRIVATE

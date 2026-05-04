@@ -25,10 +25,9 @@ int write_i2c_kbd()
     if (i2c_inited == 0)
         return -1;
 
-    retval = i2c_write_timeout_us(I2C_KBD_MOD, I2C_KBD_ADDR, msg, 1, false, 500000);
+    retval = i2c_write_timeout_us(I2C_KBD_MOD, I2C_KBD_ADDR, msg, 1, false, 10000);
     if (retval == PICO_ERROR_GENERIC || retval == PICO_ERROR_TIMEOUT)
     {
-        printf("i2c write error\n");
         i2c_failed += 1;
         return -1;
     }
@@ -47,10 +46,9 @@ int read_i2c_kbd()
     if (i2c_inited == 0)
         return -1;
 
-    retval = i2c_read_timeout_us(I2C_KBD_MOD, I2C_KBD_ADDR, (unsigned char *)&buff, 2, false, 500000);
+    retval = i2c_read_timeout_us(I2C_KBD_MOD, I2C_KBD_ADDR, (unsigned char *)&buff, 2, false, 10000);
     if (retval == PICO_ERROR_GENERIC || retval == PICO_ERROR_TIMEOUT)
     {
-        printf("i2c read error read\n");
         i2c_failed += 1;
         return -1;
     }

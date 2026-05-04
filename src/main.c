@@ -51,6 +51,8 @@
 #include <hardware/spi.h>
 #include <hardware/sync.h>
 #include <hardware/flash.h>
+#include <hardware/xip_cache.h>
+#include <pico/flash.h>
 #include <hardware/timer.h>
 #include <hardware/vreg.h>
 #include <pico/bootrom.h>
@@ -239,20 +241,19 @@ void update_full_screen()
 void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
                    const uint_fast8_t line)
 {
+    finish_write_data(false);
 #if PEANUT_FULL_GBC_SUPPORT
     if (gb->cgb.cgbMode)
     {
         for (unsigned int x = 0; x < LCD_WIDTH; x++)
         {
-            // Convert RGB555 to RGB565 properly
             uint16_t color555 = gb->cgb.fixPalette[pixels[x]];
             uint16_t r = (color555 >> 10) & 0x1F;
             uint16_t g = (color555 >> 5) & 0x1F;
             uint16_t b = color555 & 0x1F;
             uint16_t color565 = (r << 11) | ((g << 1) << 5) | b;
-            // Store in big-endian byte order (high byte first)
-            pixels_buffer[x * 2] = (uint8_t)(color565 >> 8);       // high byte
-            pixels_buffer[x * 2 + 1] = (uint8_t)(color565 & 0xFF); // low byte
+            pixels_buffer[x * 2] = (uint8_t)(color565 >> 8);
+            pixels_buffer[x * 2 + 1] = (uint8_t)(color565 & 0xFF);
         }
     }
     else
@@ -261,15 +262,13 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
         for (unsigned int x = 0; x < LCD_WIDTH; x++)
         {
             uint16_t color = palette[(pixels[x] & LCD_PALETTE_ALL) >> 4][pixels[x] & 3];
-            // Store in big-endian byte order (high byte first)
-            pixels_buffer[x * 2] = (uint8_t)(color >> 8);       // high byte
-            pixels_buffer[x * 2 + 1] = (uint8_t)(color & 0xFF); // low byte
+            pixels_buffer[x * 2] = (uint8_t)(color >> 8);
+            pixels_buffer[x * 2 + 1] = (uint8_t)(color & 0xFF);
         }
 #if PEANUT_FULL_GBC_SUPPORT
     }
 #endif
 
-    finish_write_data(false);
     if (line == 0)
     {
         start_window((WIDTH - LCD_WIDTH) / 2, ((HEIGHT - LCD_HEIGHT) / 2), LCD_WIDTH, LCD_HEIGHT);
@@ -287,23 +286,21 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
 void lcd_draw_line_bis(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
                        const uint_fast8_t line)
 {
-    // Duplicate each pixel horizontally (160 -> 320 pixels)
+    finish_write_data(false);
 #if PEANUT_FULL_GBC_SUPPORT
     if (gb->cgb.cgbMode)
     {
         for (unsigned int x = 0; x < LCD_WIDTH; x++)
         {
-            // Convert RGB555 to RGB565 properly
             uint16_t color555 = gb->cgb.fixPalette[pixels[x]];
             uint16_t r = (color555 >> 10) & 0x1F;
             uint16_t g = (color555 >> 5) & 0x1F;
             uint16_t b = color555 & 0x1F;
             uint16_t pixel = (r << 11) | ((g << 1) << 5) | b;
-            // Duplicate each pixel twice in the buffer with correct byte order
-            pixels_buffer[x * 4] = (uint8_t)(pixel >> 8);       // high byte of first pixel
-            pixels_buffer[x * 4 + 1] = (uint8_t)(pixel & 0xFF); // low byte of first pixel
-            pixels_buffer[x * 4 + 2] = (uint8_t)(pixel >> 8);   // high byte of second pixel
-            pixels_buffer[x * 4 + 3] = (uint8_t)(pixel & 0xFF); // low byte of second pixel
+            pixels_buffer[x * 4] = (uint8_t)(pixel >> 8);
+            pixels_buffer[x * 4 + 1] = (uint8_t)(pixel & 0xFF);
+            pixels_buffer[x * 4 + 2] = (uint8_t)(pixel >> 8);
+            pixels_buffer[x * 4 + 3] = (uint8_t)(pixel & 0xFF);
         }
     }
     else
@@ -311,21 +308,18 @@ void lcd_draw_line_bis(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
 #endif
         for (unsigned int x = 0; x < LCD_WIDTH; x++)
         {
-            // Duplicate each pixel twice in the buffer with correct byte order
             uint16_t pixel = palette[(pixels[x] & LCD_PALETTE_ALL) >> 4][pixels[x] & 3];
-            pixels_buffer[x * 4] = (uint8_t)(pixel >> 8);       // high byte of first pixel
-            pixels_buffer[x * 4 + 1] = (uint8_t)(pixel & 0xFF); // low byte of first pixel
-            pixels_buffer[x * 4 + 2] = (uint8_t)(pixel >> 8);   // high byte of second pixel
-            pixels_buffer[x * 4 + 3] = (uint8_t)(pixel & 0xFF); // low byte of second pixel
+            pixels_buffer[x * 4] = (uint8_t)(pixel >> 8);
+            pixels_buffer[x * 4 + 1] = (uint8_t)(pixel & 0xFF);
+            pixels_buffer[x * 4 + 2] = (uint8_t)(pixel >> 8);
+            pixels_buffer[x * 4 + 3] = (uint8_t)(pixel & 0xFF);
         }
 #if PEANUT_FULL_GBC_SUPPORT
     }
 #endif
 
-    finish_write_data(false);
     if (line == 0)
     {
-        // Double the width when starting the window
         start_window((WIDTH - (LCD_WIDTH * 2)) / 2, ((HEIGHT - (LCD_HEIGHT * 2)) / 2), LCD_WIDTH * 2, LCD_HEIGHT * 2);
     }
     else if (line == LCD_HEIGHT)
@@ -334,7 +328,6 @@ void lcd_draw_line_bis(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
     }
     else
     {
-        // Write double-width line twice to create vertical duplication
         write_data(pixels_buffer, LCD_WIDTH * 2);
         finish_write_data(false);
         write_data(pixels_buffer, LCD_WIDTH * 2);
@@ -515,69 +508,144 @@ finish:
 /**
  * Load a .gb rom file in flash from the SD card
  */
-void load_cart_rom_file(char *filename)
+/* Saved during load for post-load diagnostics */
+static uint8_t rom_sd_hdr_byte    = 0xFF;
+static uint8_t rom_sd_stored_ck   = 0xFF;
+static uint8_t rom_sd_computed_ck = 0xFF;
+static uint8_t rom_buf_hdr_byte   = 0xFF; /* buffer[0x100] from SD card — never overwritten */
+static int     last_fse_ret       = 999;  /* 999 = never called */
+static uint8_t pre_write_hdr      = 0xFF; /* flash byte 0x100 before write */
+static uint8_t post_erase_raw     = 0xFF; /* raw direct read after erase (should be 0xFF) */
+static uint8_t post_prog_raw      = 0xFF; /* raw direct read after program (should be 0x00) */
+static bool    rom_bank0_ready    = false; /* true when load_cart_rom_file filled rom_bank0 from SD */
+
+typedef struct { uint32_t offset; const uint8_t *data; } flash_sector_args_t;
+
+/* Direct SPI read of one flash byte, bypassing XIP entirely. */
+static void __no_inline_not_in_flash_func(flash_raw_read_byte)(uint32_t addr, uint8_t *out)
+{
+    uint8_t tx[5] = {0x03,
+                     (uint8_t)(addr >> 16),
+                     (uint8_t)(addr >>  8),
+                     (uint8_t)(addr),
+                     0x00};
+    uint8_t rx[5] = {0, 0, 0, 0, 0};
+    flash_do_cmd(tx, rx, 5);
+    *out = rx[4];
+}
+
+static void __no_inline_not_in_flash_func(do_flash_sector)(void *arg)
+{
+    const flash_sector_args_t *a = (const flash_sector_args_t *)arg;
+    flash_range_erase(a->offset, FLASH_SECTOR_SIZE);
+    /* Raw reads only for sector 0 — this is what WR hdr/XIP also reads */
+    if (a->offset == FLASH_TARGET_OFFSET) {
+        flash_raw_read_byte(FLASH_TARGET_OFFSET + 0x100, &post_erase_raw);
+    }
+    flash_range_program(a->offset, a->data, FLASH_SECTOR_SIZE);
+    if (a->offset == FLASH_TARGET_OFFSET) {
+        flash_raw_read_byte(FLASH_TARGET_OFFSET + 0x100, &post_prog_raw);
+    }
+}
+
+bool load_cart_rom_file(char *filename)
 {
     UINT br;
-    uint8_t buffer[FLASH_SECTOR_SIZE];
-    bool mismatch = false;
+    static uint8_t buffer[FLASH_SECTOR_SIZE];
     sd_card_t *pSD = sd_get_by_num(0);
+    last_fse_ret = 999;
+    DBG_INFO("LC1: mount\n"); stdio_flush();
     FRESULT fr = f_mount(&pSD->fatfs, pSD->pcName, 1);
     if (FR_OK != fr)
     {
-        DBG_INFO("E f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
-        return;
+        DBG_INFO("E f_mount error: %s (%d)\n", FRESULT_str(fr), fr); stdio_flush();
+        return false;
     }
+    DBG_INFO("LC2: open %s\n", filename); stdio_flush();
     FIL fil;
+    bool success = false;
+    uint32_t sector_num = 0;
     fr = f_open(&fil, filename, FA_READ);
     if (fr == FR_OK)
     {
         uint32_t flash_target_offset = FLASH_TARGET_OFFSET;
         for (;;)
         {
-            f_read(&fil, buffer, sizeof buffer, &br);
-            if (br == 0)
-                break; /* end of file */
+            FRESULT frd = f_read(&fil, buffer, sizeof buffer, &br);
+            if (frd != FR_OK || br == 0)
+                break;
 
-            DBG_INFO("I Erasing target region...\n");
-            flash_range_erase(flash_target_offset, FLASH_SECTOR_SIZE);
-            DBG_INFO("I Programming target region...\n");
-            flash_range_program(flash_target_offset, buffer, FLASH_SECTOR_SIZE);
-
-            /* Read back target region and check programming */
-            DBG_INFO("I Done. Reading back target region...\n");
-            for (uint32_t i = 0; i < FLASH_SECTOR_SIZE; i++)
+            /* On the first sector, capture header bytes and record pre-write flash state */
+            if (sector_num == 0 && br >= 0x14E)
             {
-                if (rom[flash_target_offset + i] != buffer[i])
-                {
-                    mismatch = true;
-                }
+                rom_buf_hdr_byte = buffer[0x100]; /* SD card value, never overwritten */
+                rom_sd_hdr_byte = buffer[0x100];
+                rom_sd_stored_ck = buffer[0x14D];
+                uint8_t ck = 0;
+                for (int i = 0x134; i <= 0x14C; i++)
+                    ck = ck - buffer[i] - 1;
+                rom_sd_computed_ck = ck;
+                DBG_INFO("SD s0: hdr[100]=%02X ck computed=%02X stored=%02X %s\n",
+                         rom_sd_hdr_byte, rom_sd_computed_ck, rom_sd_stored_ck,
+                         (rom_sd_computed_ck == rom_sd_stored_ck) ? "OK" : "MISMATCH");
+                /* snapshot flash before any write */
+                flash_flush_cache();
+                pre_write_hdr = ((const uint8_t *)(XIP_BASE + FLASH_TARGET_OFFSET))[0x100];
+                DBG_INFO("Pre-write flash[100]=%02X\n", pre_write_hdr);
+                stdio_flush();
             }
 
-            /* Next sector */
+            DBG_INFO("LC3/4: flash s%lu\n", sector_num); stdio_flush();
+            flash_sector_args_t args = { flash_target_offset, buffer };
+            int fse_ret = flash_safe_execute(do_flash_sector, &args, 5000);
+            last_fse_ret = fse_ret;
+            DBG_INFO("FSE s%lu ret=%d\n", sector_num, fse_ret); stdio_flush();
+            if (fse_ret != PICO_OK)
+            {
+                DBG_INFO("E flash_safe_execute failed: %d — aborting\n", fse_ret); stdio_flush();
+                break;
+            }
+            /* Fill rom_bank0 directly from SD card data — bypasses XIP cache entirely */
+            {
+                uint32_t offset_in_rom = flash_target_offset - FLASH_TARGET_OFFSET;
+                if (offset_in_rom < sizeof(rom_bank0)) {
+                    uint32_t copy_len = br;
+                    if (offset_in_rom + copy_len > (uint32_t)sizeof(rom_bank0))
+                        copy_len = (uint32_t)sizeof(rom_bank0) - offset_in_rom;
+                    memcpy((uint8_t *)rom_bank0 + offset_in_rom, buffer, copy_len);
+                }
+            }
             flash_target_offset += FLASH_SECTOR_SIZE;
+            sector_num++;
         }
-        if (mismatch)
-        {
-            DBG_INFO("I Programming successful!\n");
+        success = (sector_num > 0 && last_fse_ret == PICO_OK);
+        if (success) rom_bank0_ready = true;
+        /* Verify header bytes in flash match what was read from SD */
+        if (sector_num > 0) {
+            xip_cache_invalidate_all();  /* invalidate XIP cache — flash_flush_cache() is ROM-sequence only on RP2350 */
+            const uint8_t *xip_hdr = (const uint8_t *)(XIP_BASE + FLASH_TARGET_OFFSET);
+            rom_sd_hdr_byte      = xip_hdr[0x100]; /* reuse globals: now holds post-write XIP values */
+            rom_sd_stored_ck     = xip_hdr[0x14D];
+            uint8_t ck = 0;
+            for (int i = 0x134; i <= 0x14C; i++)
+                ck = ck - xip_hdr[i] - 1;
+            rom_sd_computed_ck = ck;
+            DBG_INFO("Flash verify: hdr[100]=%02X ck=%02X/%02X %s\n",
+                     xip_hdr[0x100], ck, xip_hdr[0x14D],
+                     (ck == xip_hdr[0x14D]) ? "OK" : "MISMATCH"); stdio_flush();
         }
-        else
-        {
-            DBG_INFO("E Programming failed!\n");
-        }
+        DBG_INFO("I load_cart_rom_file(%s) %s (%lu sectors, fse=%d)\n",
+                 filename, success ? "OK" : "FAIL", sector_num, last_fse_ret); stdio_flush();
+
+        f_close(&fil);
     }
     else
     {
-        DBG_INFO("E f_open(%s) error: %s (%d)\n", filename, FRESULT_str(fr), fr);
+        DBG_INFO("E f_open(%s) error: %s (%d)\n", filename, FRESULT_str(fr), fr); stdio_flush();
     }
 
-    fr = f_close(&fil);
-    if (fr != FR_OK)
-    {
-        DBG_INFO("E f_close error: %s (%d)\n", FRESULT_str(fr), fr);
-    }
     f_unmount(pSD->pcName);
-
-    DBG_INFO("I load_cart_rom_file(%s) COMPLETE (%lu bytes)\n", filename, br);
+    return success;
 }
 
 /**
@@ -640,7 +708,9 @@ uint16_t rom_file_selector_display_page(char filename[22][256], uint16_t num_pag
         DBG_INFO("Game: %s\n", filename[ifile]);
         draw_string(20, ifile * 20, filename[ifile]);
     }
+    DBG_INFO("DP: update_lcd\n"); stdio_flush();
     update_lcd();
+    DBG_INFO("DP: done\n"); stdio_flush();
     return num_file;
 }
 
@@ -653,9 +723,9 @@ void rom_file_selector()
 {
     DBG_INFO("ROM File Selector: Starting...\n");
     uint16_t num_page = 0;
-    char filename[22][256];
+    static char filename[22][256];
     uint16_t num_file;
-    char buf[6];
+    char buf[32];
     bool break_outer = false;
 
     /* display the first page with up to 22 rom files */
@@ -680,16 +750,24 @@ void rom_file_selector()
         {
         case KEY_A:
         case KEY_B:
-            DBG_INFO("ROM File Selector: A/B button pressed - loading ROM: %s\n", filename[selected]);
-
             rom_file_selector_display_page(filename, num_page);
-            sprintf(buf, "Loading %s", filename[selected]);
+            snprintf(buf, sizeof(buf), "Loading %s", filename[selected]);
             draw_string(0, FRAME_BUFF_HEIGHT - 20, buf);
+            DBG_INFO("A: update_lcd\n"); stdio_flush();
             update_lcd();
-            sleep_ms(150);
-
-            load_cart_rom_file(filename[selected]);
-            break_outer = true;
+            DBG_INFO("A: calling load_cart_rom_file\n"); stdio_flush();
+            if (load_cart_rom_file(filename[selected]))
+            {
+                DBG_INFO("A: load_cart_rom_file OK\n"); stdio_flush();
+                break_outer = true;
+            }
+            else
+            {
+                DBG_INFO("A: load_cart_rom_file FAILED\n"); stdio_flush();
+                draw_string(0, FRAME_BUFF_HEIGHT - 20, "Load FAILED");
+                update_lcd();
+                sleep_ms(2000);
+            }
             break;
 
         case KEY_START:
@@ -724,12 +802,15 @@ void rom_file_selector()
             selected++;
             if (selected >= num_file)
                 selected = 0;
-            DBG_INFO("ROM File Selector: Selected ROM: %s\n", filename[selected]);
-            // ili9488_text(filename[selected], 0, selected*8, 0xFFFF, 0xF800);
+            DBG_INFO("DW:1 sel=%d\n", selected); stdio_flush();
             sprintf(buf, "%02d", selected + 1);
+            DBG_INFO("DW:2\n"); stdio_flush();
             draw_string(0, FRAME_BUFF_HEIGHT - 20, buf);
+            DBG_INFO("DW:3\n"); stdio_flush();
             draw_string(0, (selected % 22) * 20, "=>");
+            DBG_INFO("DW:4\n"); stdio_flush();
             update_lcd();
+            DBG_INFO("DW:5\n"); stdio_flush();
             sleep_ms(150);
             break;
         }
@@ -747,6 +828,9 @@ void rom_file_selector()
 
 void core1_audio(void)
 {
+    /* Required on RP2350: lets core0 safely pause this core for flash operations */
+    flash_safe_execute_core_init();
+
     /* Allocate memory for the stream buffer */
     stream = malloc(AUDIO_SAMPLES_TOTAL * sizeof(int16_t));
     assert(stream != NULL);
@@ -832,14 +916,58 @@ int main(void)
         update_lcd();
 #endif
         /* Initialise GB context. */
-        memcpy(rom_bank0, rom, sizeof(rom_bank0));
+        xip_cache_invalidate_all();
+        if (!rom_bank0_ready) {
+            /* resume path: fill rom_bank0 from XIP (cache freshly invalidated above) */
+            memcpy(rom_bank0, rom, sizeof(rom_bank0));
+        }
+        rom_bank0_ready = false;
         ret = gb_init(&gb, &gb_rom_read, &gb_cart_ram_read,
                       &gb_cart_ram_write, &gb_error, NULL);
         DBG_INFO("GB ");
 
         if (ret != GB_INIT_NO_ERROR)
         {
-            DBG_INFO("Error: %d\n", ret);
+            /* Compute what gb_init saw so user can diagnose without USB */
+            uint8_t computed_ck = 0;
+            for (int i = 0x134; i <= 0x14C; i++)
+                computed_ck = computed_ck - rom_bank0[i] - 1;
+            uint8_t stored_ck = rom_bank0[0x14D];
+            DBG_INFO("GB init error: %d  hdr[0x100]=%02X ck computed=%02X stored=%02X\n",
+                     ret, rom_bank0[0x100], computed_ck, stored_ck);
+            DBG_INFO("SD values: hdr=%02X ck=%02X/%02X\n",
+                     rom_sd_hdr_byte, rom_sd_computed_ck, rom_sd_stored_ck);
+
+            char errbuf[40];
+            /* Line 1: FSE result, SD buf byte, pre-write flash byte */
+            snprintf(errbuf, sizeof(errbuf), "FSE=%d buf=%02X pre=%02X",
+                     last_fse_ret, rom_buf_hdr_byte, pre_write_hdr);
+            draw_string(0, FRAME_BUFF_HEIGHT / 2 - 80, errbuf);
+            /* Line 2: raw direct-SPI reads (bypass XIP): after erase and after program */
+            snprintf(errbuf, sizeof(errbuf), "er=%02X pr=%02X (raw)",
+                     post_erase_raw, post_prog_raw);
+            draw_string(0, FRAME_BUFF_HEIGHT / 2 - 60, errbuf);
+            /* Line 3: post-write XIP readback */
+            snprintf(errbuf, sizeof(errbuf), "WR hdr=%02X ck=%02X/%02X%s",
+                     rom_sd_hdr_byte, rom_sd_computed_ck, rom_sd_stored_ck,
+                     (rom_sd_computed_ck == rom_sd_stored_ck) ? " OK" : " BAD");
+            draw_string(0, FRAME_BUFF_HEIGHT / 2 - 40, errbuf);
+            /* Line 4: what gb_init read from rom_bank0 */
+            snprintf(errbuf, sizeof(errbuf), "RD hdr=%02X ck=%02X/%02X%s",
+                     rom_bank0[0x100], computed_ck, stored_ck,
+                     (computed_ck == stored_ck) ? " OK" : " BAD");
+            draw_string(0, FRAME_BUFF_HEIGHT / 2 - 20, errbuf);
+            /* Line 5: do WR and RD agree? */
+            bool wr_rd_match = (rom_sd_hdr_byte == rom_bank0[0x100]) &&
+                               (rom_sd_stored_ck == stored_ck);
+            snprintf(errbuf, sizeof(errbuf), "WR==RD: %s", wr_rd_match ? "YES" : "NO");
+            draw_string(0, FRAME_BUFF_HEIGHT / 2, errbuf);
+            if (ret == GB_INIT_INVALID_CHECKSUM)
+                draw_string(0, FRAME_BUFF_HEIGHT / 2 + 20, "Bad checksum");
+            else if (ret == GB_INIT_CARTRIDGE_UNSUPPORTED)
+                draw_string(0, FRAME_BUFF_HEIGHT / 2 + 20, "Unsupported cart");
+            update_lcd();
+            sleep_ms(5000);
             goto out;
         }
 
