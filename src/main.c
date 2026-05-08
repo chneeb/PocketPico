@@ -272,9 +272,11 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
     if (line == 0)
     {
         start_window((WIDTH - LCD_WIDTH) / 2, ((HEIGHT - LCD_HEIGHT) / 2), LCD_WIDTH, LCD_HEIGHT);
+        write_data(pixels_buffer, LCD_WIDTH);
     }
-    else if (line == LCD_HEIGHT)
+    else if (line == LCD_HEIGHT - 1)
     {
+        write_data(pixels_buffer, LCD_WIDTH);
         finish_write_data(true);
     }
     else
@@ -321,9 +323,15 @@ void lcd_draw_line_bis(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
     if (line == 0)
     {
         start_window((WIDTH - (LCD_WIDTH * 2)) / 2, ((HEIGHT - (LCD_HEIGHT * 2)) / 2), LCD_WIDTH * 2, LCD_HEIGHT * 2);
+        write_data(pixels_buffer, LCD_WIDTH * 2);
+        finish_write_data(false);
+        write_data(pixels_buffer, LCD_WIDTH * 2);
     }
-    else if (line == LCD_HEIGHT)
+    else if (line == LCD_HEIGHT - 1)
     {
+        write_data(pixels_buffer, LCD_WIDTH * 2);
+        finish_write_data(false);
+        write_data(pixels_buffer, LCD_WIDTH * 2);
         finish_write_data(true);
     }
     else

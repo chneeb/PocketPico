@@ -8,8 +8,8 @@ Forked from TheKiwil/PocketPico which is itself a fork of slintak/PocketPico (or
 
 ## Hardware
 - **MCU:** RP2350 (Pico 2), dual Cortex-M33, overclocked to 300 MHz
-- **Display:** ILI9488 3.5" LCD, 320×480, driven via PIO0 + DMA
-- **Keyboard:** I2C keyboard (PicoCalc QWERTY), polled via hardware alarm 0 every 1ms
+- **Display:** ILI9488 3.5" LCD, physical 320×480, driven via PIO0 + DMA. `WIDTH=320, HEIGHT=320` in code — only the first 320 rows are used. Game image (2× scaled: 320×288) is centered vertically with 16-pixel margins top and bottom.
+- **Keyboard:** I2C keyboard (PicoCalc QWERTY), polled via hardware alarm 0 (`TIMER0_IRQ_0`). Timer fires every 1ms (`TICKSPERSEC=1000µs`); I2C read/write done every 16ms (`KEYCHECKTIME=16`).
 - **SD card:** SPI0 (GPIO 16–19), FatFS, stores `.gb` ROM files and save states
 - **Audio:** I2S via PIO1, GPIO 26 (data) / 27 (BCLK) / 28 (LRCLK), 32768 Hz stereo
 - **Flash:** W25Q series, 1MB firmware + ROM stored at `FLASH_TARGET_OFFSET = 0x100000` (1MB offset)
@@ -41,6 +41,13 @@ Binary type: `copy_to_ram` — all code executes from SRAM.
 
 **Fix:** Moved `finish_write_data(false)` to be the first statement in both `lcd_draw_line` and `lcd_draw_line_bis` — DMA is guaranteed complete before the buffer is overwritten.
 
+### LCD last-row corruption / frame boundary fix
+**Problem:** The original code had two bugs in `lcd_draw_line` and `lcd_draw_line_bis`:
+1. `line == 0` called `start_window()` but never sent pixel data, so GB line 0 was skipped. Lines 1–143 wrote 2 rows each = 286 rows in a 288-row window.
+2. `line == LCD_HEIGHT` (144) was the trigger for `finish_write_data(true)` / next `start_window` — but peanut-gb never calls the draw callback with `line=144` (that's VBLANK). So CS was never deasserted between frames, and the next frame's CASET/RASET command bytes landed as pixel data in the two unfilled rows.
+
+**Fix (`lcd_draw_line` and `lcd_draw_line_bis`):** Write pixel data for `line == 0` immediately after `start_window()`; changed the trigger from `line == LCD_HEIGHT` (dead code) to `line == LCD_HEIGHT - 1`; call `finish_write_data(true)` on the last line to deassert CS cleanly.
+
 ### I2C keyboard starvation
 The original I2C timeout was 500ms per operation; the 1ms interrupt fired every tick, causing the CPU to spend most of its time in I2C timeouts. Changed to 10ms (10000µs).
 
@@ -50,8 +57,8 @@ Added `flash_safe_execute_core_init()` at the start of `core1_audio` so core0 ca
 ## ROM Loading Workflow
 1. Copy `.gb` files to the root of a FAT32 micro SD card
 2. Power on → file selector appears
-3. Select ROM with A or B → "Loading..." → game starts
-4. Press Start in selector to resume last loaded ROM (reads from flash directly)
+3. Select ROM with **A or B** → "Loading..." → ROM written to flash, `rom_bank0` filled from SD buffer → game starts
+4. **Start** in selector currently attempts to resume from flash directly (skips `load_cart_rom_file`) — unreliable because XIP cache invalidation is not reliable on RP2350. **TODO:** make Start behave like A/B (load from SD).
 
 ## Gotchas
 - `copy_to_ram` means all code runs from SRAM — `__no_inline_not_in_flash_func` still used for flash operation callbacks but is largely redundant
@@ -59,3 +66,8 @@ Added `flash_safe_execute_core_init()` at the start of `core1_audio` so core0 ca
 - `PICO_ENTER_USB_BOOT_ON_EXIT=1` — device enters BOOTSEL on firmware exit/crash
 - `xip_cache_invalidate_all()` is called before the game loop and before any resume-from-flash path, but its effectiveness on this hardware is unreliable for post-write cache invalidation — hence the SD-direct fill of `rom_bank0`
 - `ENABLE_DEBUG 1` is set — DBG_INFO outputs to USB serial. Do not add `stdio_flush()` in hot paths (update_lcd, draw line callbacks)
+- `lcd_draw_line_bis` is the active draw callback (registered via `gb_init_lcd`). `lcd_draw_line` exists but is not used.
+- `gb_init` bad-checksum diagnostic: if FSE=999 it means `flash_safe_execute` was never called — the ROM in flash was not updated this session. User pressed Start (resume path) instead of A/B (SD load path), or SD mount/open failed.
+
+## Known Issues
+- **Display tearing / "jumpy row":** Occasional 1-row visual jump during gameplay, more noticeable during key presses. Root cause: no vsync synchronisation between emulator frame writes and the ILI9488's internal panel refresh. The 1ms keyboard alarm IRQ (hardware alarm 0, `TIMER0_IRQ_0`) fires every 16ms to poll I2C; if it fires mid-frame while CS is held LOW, the SPI stream pauses and the display scan can drift past the write position. Disabling the alarm IRQ during `gb_run_frame` eliminates tearing but also breaks emulator input — not an acceptable trade-off. No clean fix found yet without vsync (TE pin) support.
