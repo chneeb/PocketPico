@@ -24,6 +24,7 @@
 #define SYS_CLK_FREQ 300 * MHZ
 
 #define ENABLE_DEBUG 1
+#define FULL_FRAME_LCD_STAGING 1
 
 // Display selection
 #define USE_ILI9225 0
@@ -84,6 +85,9 @@
 #define FRAME_BUFF_WIDTH 240
 #define FRAME_BUFF_STRIDE (FRAME_BUFF_WIDTH * 2)
 #define FRAME_BUFF_HEIGHT 240
+#define GAME_FRAME_WIDTH (LCD_WIDTH * 2)
+#define GAME_FRAME_HEIGHT (LCD_HEIGHT * 2)
+#define GAME_FRAME_STRIDE (GAME_FRAME_WIDTH * 2)
 
 #if ENABLE_SOUND
 
@@ -152,8 +156,16 @@ static struct
     unsigned down : 1;
 } prev_joypad_bits;
 
-/* Pixel data is stored in here. */
+/* Pixel data for full-frame UI/menu drawing. */
 static uint8_t pixels_buffer[FRAME_BUFF_STRIDE * 240 * 2];
+_Static_assert(sizeof(pixels_buffer) >= (GAME_FRAME_STRIDE * GAME_FRAME_HEIGHT),
+               "pixels_buffer must fit one 2x-scaled game frame");
+
+/* Ping-pong scanline buffers used by the Game Boy LCD callback while DMA is active. */
+#define SCANLINE_BUF_SIZE GAME_FRAME_STRIDE
+static uint8_t pixels_buf_a[SCANLINE_BUF_SIZE];
+static uint8_t pixels_buf_b[SCANLINE_BUF_SIZE];
+static uint8_t *scanline_buf;
 
 /**
  * Returns a byte from the ROM file at the given address.
@@ -209,6 +221,7 @@ void draw_string(int x, int y, const char *str)
         x, y, str, 0xffff);
 }
 
+__attribute__((optimize("-Og")))
 void clear_frame_buff()
 {
     for (int i = 0; i < FRAME_BUFF_STRIDE * FRAME_BUFF_HEIGHT * 2; i++)
@@ -217,6 +230,7 @@ void clear_frame_buff()
     }
 }
 
+__attribute__((optimize("-Og")))
 void clear_screen_buff()
 {
     for (int i = 0; i < (WIDTH)*HEIGHT * 2; i++)
@@ -241,7 +255,11 @@ void update_full_screen()
 void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
                    const uint_fast8_t line)
 {
-    finish_write_data(false);
+    if (line == 0)
+        scanline_buf = pixels_buf_a;
+    else
+        scanline_buf = (scanline_buf == pixels_buf_a) ? pixels_buf_b : pixels_buf_a;
+
 #if PEANUT_FULL_GBC_SUPPORT
     if (gb->cgb.cgbMode)
     {
@@ -252,8 +270,8 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
             uint16_t g = (color555 >> 5) & 0x1F;
             uint16_t b = color555 & 0x1F;
             uint16_t color565 = (r << 11) | ((g << 1) << 5) | b;
-            pixels_buffer[x * 2] = (uint8_t)(color565 >> 8);
-            pixels_buffer[x * 2 + 1] = (uint8_t)(color565 & 0xFF);
+            scanline_buf[x * 2] = (uint8_t)(color565 >> 8);
+            scanline_buf[x * 2 + 1] = (uint8_t)(color565 & 0xFF);
         }
     }
     else
@@ -262,8 +280,8 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
         for (unsigned int x = 0; x < LCD_WIDTH; x++)
         {
             uint16_t color = palette[(pixels[x] & LCD_PALETTE_ALL) >> 4][pixels[x] & 3];
-            pixels_buffer[x * 2] = (uint8_t)(color >> 8);
-            pixels_buffer[x * 2 + 1] = (uint8_t)(color & 0xFF);
+            scanline_buf[x * 2] = (uint8_t)(color >> 8);
+            scanline_buf[x * 2 + 1] = (uint8_t)(color & 0xFF);
         }
 #if PEANUT_FULL_GBC_SUPPORT
     }
@@ -272,23 +290,37 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
     if (line == 0)
     {
         start_window((WIDTH - LCD_WIDTH) / 2, ((HEIGHT - LCD_HEIGHT) / 2), LCD_WIDTH, LCD_HEIGHT);
-        write_data(pixels_buffer, LCD_WIDTH);
+
+        write_data(scanline_buf, LCD_WIDTH);
+        finish_write_data(false);
     }
     else if (line == LCD_HEIGHT - 1)
     {
-        write_data(pixels_buffer, LCD_WIDTH);
+        /* Last scanline: send pixel data and close window. */
+        write_data(scanline_buf, LCD_WIDTH);
         finish_write_data(true);
     }
     else
     {
-        write_data(pixels_buffer, LCD_WIDTH);
+        write_data(scanline_buf, LCD_WIDTH);
+        finish_write_data(false);
     }
 }
 
 void lcd_draw_line_bis(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
                        const uint_fast8_t line)
 {
-    finish_write_data(false);
+#if FULL_FRAME_LCD_STAGING
+    uint8_t *row = pixels_buffer + (line * 2 * GAME_FRAME_STRIDE);
+#else
+    if (line == 0)
+        scanline_buf = pixels_buf_a;
+    else
+        scanline_buf = (scanline_buf == pixels_buf_a) ? pixels_buf_b : pixels_buf_a;
+
+    uint8_t *row = scanline_buf;
+#endif
+
 #if PEANUT_FULL_GBC_SUPPORT
     if (gb->cgb.cgbMode)
     {
@@ -299,10 +331,10 @@ void lcd_draw_line_bis(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
             uint16_t g = (color555 >> 5) & 0x1F;
             uint16_t b = color555 & 0x1F;
             uint16_t pixel = (r << 11) | ((g << 1) << 5) | b;
-            pixels_buffer[x * 4] = (uint8_t)(pixel >> 8);
-            pixels_buffer[x * 4 + 1] = (uint8_t)(pixel & 0xFF);
-            pixels_buffer[x * 4 + 2] = (uint8_t)(pixel >> 8);
-            pixels_buffer[x * 4 + 3] = (uint8_t)(pixel & 0xFF);
+            row[x * 4] = (uint8_t)(pixel >> 8);
+            row[x * 4 + 1] = (uint8_t)(pixel & 0xFF);
+            row[x * 4 + 2] = (uint8_t)(pixel >> 8);
+            row[x * 4 + 3] = (uint8_t)(pixel & 0xFF);
         }
     }
     else
@@ -311,35 +343,51 @@ void lcd_draw_line_bis(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
         for (unsigned int x = 0; x < LCD_WIDTH; x++)
         {
             uint16_t pixel = palette[(pixels[x] & LCD_PALETTE_ALL) >> 4][pixels[x] & 3];
-            pixels_buffer[x * 4] = (uint8_t)(pixel >> 8);
-            pixels_buffer[x * 4 + 1] = (uint8_t)(pixel & 0xFF);
-            pixels_buffer[x * 4 + 2] = (uint8_t)(pixel >> 8);
-            pixels_buffer[x * 4 + 3] = (uint8_t)(pixel & 0xFF);
+            row[x * 4] = (uint8_t)(pixel >> 8);
+            row[x * 4 + 1] = (uint8_t)(pixel & 0xFF);
+            row[x * 4 + 2] = (uint8_t)(pixel >> 8);
+            row[x * 4 + 3] = (uint8_t)(pixel & 0xFF);
         }
 #if PEANUT_FULL_GBC_SUPPORT
     }
 #endif
 
+#if FULL_FRAME_LCD_STAGING
+    memcpy(row + GAME_FRAME_STRIDE, row, GAME_FRAME_STRIDE);
+
+    if (line == LCD_HEIGHT - 1)
+    {
+        start_write_data((WIDTH - GAME_FRAME_WIDTH) / 2,
+                         (HEIGHT - GAME_FRAME_HEIGHT) / 2,
+                         GAME_FRAME_WIDTH, GAME_FRAME_HEIGHT,
+                         pixels_buffer);
+        finish_write_data(true);
+    }
+#else
     if (line == 0)
     {
         start_window((WIDTH - (LCD_WIDTH * 2)) / 2, ((HEIGHT - (LCD_HEIGHT * 2)) / 2), LCD_WIDTH * 2, LCD_HEIGHT * 2);
-        write_data(pixels_buffer, LCD_WIDTH * 2);
+
+        write_data(scanline_buf, LCD_WIDTH * 2);
         finish_write_data(false);
-        write_data(pixels_buffer, LCD_WIDTH * 2);
+        write_data(scanline_buf, LCD_WIDTH * 2);
+        finish_write_data(false);
     }
     else if (line == LCD_HEIGHT - 1)
     {
-        write_data(pixels_buffer, LCD_WIDTH * 2);
+        write_data(scanline_buf, LCD_WIDTH * 2);
         finish_write_data(false);
-        write_data(pixels_buffer, LCD_WIDTH * 2);
+        write_data(scanline_buf, LCD_WIDTH * 2);
         finish_write_data(true);
     }
     else
     {
-        write_data(pixels_buffer, LCD_WIDTH * 2);
+        write_data(scanline_buf, LCD_WIDTH * 2);
         finish_write_data(false);
-        write_data(pixels_buffer, LCD_WIDTH * 2);
+        write_data(scanline_buf, LCD_WIDTH * 2);
+        finish_write_data(false);
     }
+#endif
 }
 #endif
 
