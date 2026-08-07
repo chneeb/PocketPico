@@ -49,6 +49,10 @@ target_link_libraries(PocketPico
         pico_binary_info ili9488_p audio)
         
 target_compile_definitions(PocketPico PRIVATE
+        # core1 runs audio only and never touches XIP (copy_to_ram), so
+        # flash_safe_execute() must not lock it out — the lockout handler would
+        # eat the audio commands sent over the inter-core FIFO.
+        PICO_FLASH_ASSUME_CORE1_SAFE=1
         PARAM_ASSERTIONS_DISABLE_ALL=1
         PICO_ENTER_USB_BOOT_ON_EXIT=1
         PICO_STDIO_ENABLE_CRLF_SUPPORT=0

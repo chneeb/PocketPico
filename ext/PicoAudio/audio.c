@@ -106,11 +106,14 @@ void i2s_init(i2s_config_t *i2s_config) {
     gpio_set_function(PWM_PIN1, GPIO_FUNC_PWM);
     uint slice_num = pwm_gpio_to_slice_num(PWM_PIN0);
 
-    uint32_t SYS_CLK_FREQ = 300 * MHZ;
-    int SPK_PWM_FREQ = 22050;
+    /* The PWM wrap rate is what paces the DMA (it is the DREQ source), so it is
+     * the actual playback rate and must match the rate the samples were
+     * generated at. Derive it from the caller's sample_freq and the live system
+     * clock rather than hardcoding 22050 Hz / 300 MHz, otherwise playback runs
+     * at the wrong pitch and back-pressures whoever is producing samples. */
     int pwm_period = 1 << 8;
-    float pwm_clkdiv = ((float)SYS_CLK_FREQ / SPK_PWM_FREQ) / pwm_period;
-   
+    float pwm_clkdiv = ((float)clock_get_hz(clk_sys) / i2s_config->sample_freq) / pwm_period;
+
     pwm_config c_pwm=pwm_get_default_config();
     //pwm_config_set_clkdiv(&c_pwm,1.0);
     pwm_config_set_clkdiv(&c_pwm, pwm_clkdiv);
@@ -139,6 +142,42 @@ void i2s_init(i2s_config_t *i2s_config) {
     );
 
     pio_sm_set_enabled(i2s_config->pio, i2s_config->sm , true);
+}
+
+/**
+ * Change the playback rate after i2s_init().
+ * In PWM mode the PWM wrap rate is the DMA's DREQ source and therefore the
+ * actual playback rate, so this reprograms the PWM clock divider. The caller
+ * uses this to follow a producer whose real output rate is not known until it
+ * has been running (e.g. an emulator that does not hit its nominal frame rate).
+ */
+void i2s_set_sample_freq(i2s_config_t *i2s_config, uint32_t sample_freq) {
+    if(sample_freq == 0)
+        return;
+
+    i2s_config->sample_freq = sample_freq;
+
+#ifdef AUDIO_PWM_PIN
+    {
+        uint slice_num = pwm_gpio_to_slice_num(PWM_PIN0);
+        int pwm_period = 1 << 8;
+        float clkdiv = ((float)clock_get_hz(clk_sys) / sample_freq) / pwm_period;
+
+        /* PWM divider is 8.4 fixed point: valid range is [1.0, 255.9375). */
+        if(clkdiv < 1.0f)
+            clkdiv = 1.0f;
+        else if(clkdiv > 255.0f)
+            clkdiv = 255.0f;
+
+        pwm_set_clkdiv(slice_num, clkdiv);
+    }
+#else
+    {
+        uint32_t divider = clock_get_hz(clk_sys) * 4 / sample_freq;
+        pio_sm_set_clkdiv_int_frac(i2s_config->pio, i2s_config->sm,
+                                   divider >> 8u, divider & 0xffu);
+    }
+#endif
 }
 
 /**

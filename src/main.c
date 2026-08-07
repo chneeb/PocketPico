@@ -25,6 +25,13 @@
 
 #define ENABLE_DEBUG 1
 #define FULL_FRAME_LCD_STAGING 1
+/* Periodic APU/PWM/frame-budget diagnostics over USB serial. Set to 1 to get
+ * per-interval `AUD` and `FPS: ... lcd/blk/pac/emu` lines; costs a little
+ * printf time on both cores, so keep it off normally. */
+#define AUDIO_DEBUG 0
+/* Pace audio playback at the rate the emulator actually produces samples,
+ * rather than the nominal AUDIO_SAMPLE_RATE (which assumes 59.7 fps). */
+#define ADAPTIVE_AUDIO_RATE 1
 
 // Display selection
 #define USE_ILI9225 0
@@ -160,6 +167,26 @@ static struct
 static uint8_t pixels_buffer[FRAME_BUFF_STRIDE * 240 * 2];
 _Static_assert(sizeof(pixels_buffer) >= (GAME_FRAME_STRIDE * GAME_FRAME_HEIGHT),
                "pixels_buffer must fit one 2x-scaled game frame");
+
+#if AUDIO_DEBUG
+/* Temporary: microseconds spent blocked in the full-frame LCD transfer,
+ * accumulated per reporting interval by the draw callback (core0 only). */
+static uint32_t lcd_xfer_us = 0;
+/* Temporary: per-interval microseconds core0 spent blocked pushing audio, and
+ * waiting in the frame pacer. Separate from the adaptive controller's own
+ * accumulator, which uses a different window length. */
+static uint32_t block_dbg_us = 0;
+static uint32_t pacer_dbg_us = 0;
+#endif
+
+#if ADAPTIVE_AUDIO_RATE
+/* Playback rate in Hz that core0 has measured and wants core1 to run at.
+ * 0 until the first window completes. */
+static volatile uint32_t audio_target_rate = 0;
+/* Microseconds core0 spent blocked pushing audio during the current
+ * measurement window. */
+static uint32_t audio_block_us = 0;
+#endif
 
 /* Ping-pong scanline buffers used by the Game Boy LCD callback while DMA is active. */
 #define SCANLINE_BUF_SIZE GAME_FRAME_STRIDE
@@ -357,11 +384,17 @@ void lcd_draw_line_bis(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
 
     if (line == LCD_HEIGHT - 1)
     {
+#if AUDIO_DEBUG
+        uint64_t xfer_t0 = time_us_64();
+#endif
         start_write_data((WIDTH - GAME_FRAME_WIDTH) / 2,
                          (HEIGHT - GAME_FRAME_HEIGHT) / 2,
                          GAME_FRAME_WIDTH, GAME_FRAME_HEIGHT,
                          pixels_buffer);
         finish_write_data(true);
+#if AUDIO_DEBUG
+        lcd_xfer_us += (uint32_t)(time_us_64() - xfer_t0);
+#endif
     }
 #else
     if (line == 0)
@@ -469,7 +502,7 @@ void write_cart_ram_file(struct gb_s *gb)
 {
     char filename[48];
     uint_fast32_t save_size;
-    UINT bw;
+    UINT bw = 0; /* reported below even when save_size == 0 skips the write */
 
     gb_save_path(gb, "", filename, sizeof filename);
     save_size = gb_get_save_size(gb);
@@ -862,29 +895,25 @@ void rom_file_selector()
         {
         case KEY_A:
         case KEY_B:
+        case KEY_START:
             rom_file_selector_display_page(filename, num_page);
             snprintf(buf, sizeof(buf), "Loading %s", rom_basename(filename[selected]));
             draw_string(0, FRAME_BUFF_HEIGHT - 20, buf);
-            DBG_INFO("A: update_lcd\n"); stdio_flush();
+            DBG_INFO("Load: update_lcd\n"); stdio_flush();
             update_lcd();
-            DBG_INFO("A: calling load_cart_rom_file\n"); stdio_flush();
+            DBG_INFO("Load: calling load_cart_rom_file\n"); stdio_flush();
             if (load_cart_rom_file(filename[selected]))
             {
-                DBG_INFO("A: load_cart_rom_file OK\n"); stdio_flush();
+                DBG_INFO("Load: load_cart_rom_file OK\n"); stdio_flush();
                 break_outer = true;
             }
             else
             {
-                DBG_INFO("A: load_cart_rom_file FAILED\n"); stdio_flush();
+                DBG_INFO("Load: load_cart_rom_file FAILED\n"); stdio_flush();
                 draw_string(0, FRAME_BUFF_HEIGHT - 20, "Load FAILED");
                 update_lcd();
                 sleep_ms(2000);
             }
-            break;
-
-        case KEY_START:
-            DBG_INFO("ROM File Selector: Start button pressed - resuming last game\n");
-            break_outer = true;
             break;
 
         case KEY_UP:
@@ -940,15 +969,23 @@ void rom_file_selector()
 
 void core1_audio(void)
 {
-    /* Required on RP2350: lets core0 safely pause this core for flash operations */
-    flash_safe_execute_core_init();
+    /*
+     * Do NOT call flash_safe_execute_core_init() here. It installs
+     * multicore_lockout_handler() as an exclusive handler on this core's SIO
+     * FIFO IRQ, and that handler drains and discards every FIFO word that is
+     * not LOCKOUT_MAGIC_START — including our AUDIO_CMD_* commands, which then
+     * never reach the multicore_fifo_pop_blocking_inline() below (silence, with
+     * no other visible symptom). This core is instead declared safe via
+     * PICO_FLASH_ASSUME_CORE1_SAFE=1: copy_to_ram puts all code and rodata in
+     * SRAM, so core1 touches no XIP while core0 erases/programs flash.
+     */
 
     /* Allocate memory for the stream buffer */
     stream = malloc(AUDIO_SAMPLES_TOTAL * sizeof(int16_t));
     assert(stream != NULL);
     memset(stream, 0, AUDIO_SAMPLES_TOTAL * sizeof(int16_t));
 
-    /* Initialize I2S sound driver (using PIO0) */
+    /* Initialize the PWM/I2S sound driver (see AUDIO_PWM_PIN note in audio.c) */
     i2s_config_t i2s_config = i2s_get_default_config();
     i2s_config.sample_freq = AUDIO_SAMPLE_RATE;
     i2s_config.dma_trans_count = AUDIO_SAMPLES;
@@ -958,7 +995,23 @@ void core1_audio(void)
     /* Initialize audio emulation. */
     audio_init(&apu_ctx);
 
-    DBG_INFO("I Audio ready on core1.\n");
+    /*
+     * Work around a minigb_apu bug: audio_init() replays its register defaults
+     * in ascending address order, but audio_write() discards every write while
+     * the APU is powered off (NR52 == 0) — and NR52 is the *last* register it
+     * writes. So NR50 (master volume) and NR51 (channel routing) never take
+     * effect, ctx->vol_l/vol_r stay 0, and every channel multiplies out to
+     * silence no matter how loudly it triggers. A game booting from scratch
+     * sets these itself during its audio init, but we always resume from a save
+     * state well past that code, and apu_ctx is not part of the saved state —
+     * so nothing ever restores them. NR52 is set by now, so these stick.
+     */
+    audio_write(&apu_ctx, 0xFF24, 0x77); /* NR50: master volume, both channels */
+    audio_write(&apu_ctx, 0xFF25, 0xF3); /* NR51: default channel routing */
+
+    DBG_INFO("I Audio ready on core1. samples=%u dma_ch=%u vol=%u nr50=%02X\n",
+             (unsigned)AUDIO_SAMPLES, i2s_config.dma_channel, i2s_config.volume,
+             audio_read(&apu_ctx, 0xFF24));
 
     while (1)
     {
@@ -966,7 +1019,56 @@ void core1_audio(void)
         switch (cmd)
         {
         case AUDIO_CMD_PLAYBACK:
+#if ADAPTIVE_AUDIO_RATE
+            /*
+             * Adopt the rate core0 measured. The measurement cannot be done
+             * here: once the drain rate falls below production this loop
+             * becomes the bottleneck, so its period reflects the drain rather
+             * than production, agrees with whatever rate is already set, and
+             * can never climb back out. Core0 measures it instead, excluding
+             * the time it spends back-pressured by us.
+             *
+             * Ignore drift under 2% so the rate does not thrash; that threshold
+             * is deliberately larger than core0's 1% safety shade, so the shade
+             * cannot ratchet the rate down window after window.
+             */
+            {
+                uint32_t want = audio_target_rate;
+                uint32_t cur = i2s_config.sample_freq;
+
+                if (want != 0 &&
+                    (want > cur ? want - cur : cur - want) > cur / 50u)
+                {
+                    i2s_set_sample_freq(&i2s_config, want);
+                    DBG_INFO("AUD rate %lu -> %lu Hz\n", cur, want);
+                }
+            }
+#endif
             audio_callback(&apu_ctx, stream);
+#if AUDIO_DEBUG
+            /* Every ~2s report whether the APU is producing anything and what
+             * actually reaches the PWM compare register. peak==0 means the APU
+             * is silent; peak>0 with a flat pwm value means the output stage
+             * is at fault. */
+            {
+                static uint32_t cb_count = 0;
+                if ((cb_count++ % 120) == 0)
+                {
+                    int16_t peak = 0;
+                    for (unsigned i = 0; i < AUDIO_SAMPLES_TOTAL; i++)
+                    {
+                        int16_t v = stream[i] < 0 ? (int16_t)-stream[i] : stream[i];
+                        if (v > peak)
+                            peak = v;
+                    }
+                    DBG_INFO("AUD n=%lu peak=%d nr52=%02X nr50=%02X pwm=%u\n",
+                             cb_count, peak,
+                             audio_read(&apu_ctx, 0xFF26),
+                             audio_read(&apu_ctx, 0xFF24),
+                             i2s_config.dma_buf ? i2s_config.dma_buf[0] : 0);
+                }
+            }
+#endif
             i2s_dma_write(&i2s_config, stream);
             break;
 
@@ -986,6 +1088,13 @@ void core1_audio(void)
     HEDLEY_UNREACHABLE();
 }
 #endif
+
+/* Real Game Boy frame period: SCREEN_REFRESH_CYCLES / DMG_CLOCK_FREQ, i.e.
+ * 70224 / 4194304 Hz = 59.727 fps = 16742 us. */
+/* Integer, so the pacer does no floating-point work per frame — the source
+ * constants are doubles (peanut_gb.h:164). Truncating 16742.7 to 16742 costs
+ * 0.004% in speed, which is nothing next to the 1% audio safety shade. */
+#define GB_FRAME_PERIOD_US ((uint64_t)(1000000.0 * SCREEN_REFRESH_CYCLES / DMG_CLOCK_FREQ))
 
 int main(void)
 {
@@ -1023,6 +1132,20 @@ int main(void)
 #endif
 
 #if ENABLE_LCD
+        /*
+         * The argument is the LCD bit rate: the PIO program spends 2 cycles per
+         * bit and setup_pio() sets div = sys_clk / 2 / speed, so speed is what
+         * actually reaches the panel. The full-frame transfer is 320*288*2
+         * bytes, and at SYS_CLK_FREQ/4 (75 Mbit/s) it blocked ~19.9 ms of every
+         * 24.9 ms frame — 80% of the budget, capping the emulator at 40 fps.
+         *
+         * Measured on hardware (ILI9488 over the PicoCalc ribbon):
+         *   SYS_CLK_FREQ/2 (150 Mbit/s) — solid garbage, panel cannot take it.
+         *   SYS_CLK_FREQ/3 (100 Mbit/s) — ~14.9 ms, 51 fps, but intermittent
+         *                                 distortion; too close to the cliff.
+         *   SYS_CLK_FREQ/4  (75 Mbit/s) — ~19.9 ms, 40 fps, stable.
+         * Back at /4 until the safe ceiling between 75 and 100 is bisected.
+         */
         set_spi_speed(SYS_CLK_FREQ / 4);
         clear_frame_buff();
         update_lcd();
@@ -1089,13 +1212,27 @@ int main(void)
 #endif
 
         /* Automatically assign a colour palette to the game */
-        char rom_title[16];
+        char rom_title[17]; /* header title is 16 bytes (0x134..0x143) plus terminator */
         auto_assign_palette(palette, gb_colour_hash(&gb), gb_get_rom_name(&gb, rom_title));
 
 #if ENABLE_LCD
         gb_init_lcd(&gb, &lcd_draw_line_bis);
         DBG_INFO("LCD ");
 #endif
+
+        /*
+         * Render every other frame. The LCD transfer is ~19.9 ms of a 24.9 ms
+         * frame, which caps full rendering at ~40 fps — 67% of real speed, and
+         * the reason both the game and its audio ran slow. Halving the render
+         * rate leaves headroom over 59.727 Hz, which the pacer spends on
+         * running at true speed instead. Display refresh drops to ~30 Hz;
+         * select + A toggles this at runtime.
+         *
+         * Must come after gb_init_lcd(), which resets frame_skip to 0
+         * (peanut_gb.h:4168) — and after the state restore, which would
+         * otherwise carry over whatever the flag was when the state was saved.
+         */
+        gb.direct.frame_skip = 1;
 
 #if ENABLE_SDCARD
         /* Load Save File. */
@@ -1105,18 +1242,163 @@ int main(void)
         DBG_INFO("\n> ");
         uint_fast32_t frames = 0;
         uint64_t start_time = time_us_64();
+        uint64_t next_frame_at = time_us_64();
         while (1)
         {
             int input;
+
+            /*
+             * Throttle to the real Game Boy frame rate. This only ever limits:
+             * when the emulator cannot keep up (frame_skip off) `now` is always
+             * past the deadline and it never waits, so the fallback is simply
+             * the old behaviour.
+             */
+            {
+                uint64_t now;
+
+                /*
+                 * Advance the deadline by exactly one period every frame, so a
+                 * frame that overruns is paid back by the next short one. This
+                 * matters with frame_skip, where work alternates ~22.7 ms
+                 * (rendered) and ~2.8 ms (skipped): only the *pair* fits in two
+                 * periods. Resyncing on every overrun instead — as this did
+                 * originally — discards the deficit, so the short frame waits a
+                 * full fresh period and the pair costs 22.7 + 16.7 ms rather
+                 * than 2 x 16.742, capping the emulator near 50 fps.
+                 */
+                next_frame_at += GB_FRAME_PERIOD_US;
+                now = time_us_64();
+
+                if (now < next_frame_at)
+                {
+#if AUDIO_DEBUG
+                    pacer_dbg_us += (uint32_t)(next_frame_at - now);
+#endif
+                    busy_wait_until(from_us_since_boot(next_frame_at));
+                }
+                else if (now - next_frame_at > 4u * GB_FRAME_PERIOD_US)
+                {
+                    /* Far behind (a stall, or simply not fast enough): drop the
+                     * accumulated deficit rather than running a catch-up burst
+                     * to repay time that can never be made up. */
+                    next_frame_at = now;
+                }
+            }
 
             /* Execute CPU cycles until the screen has to be redrawn. */
             gb_run_frame(&gb);
 
             frames++;
-#if ENABLE_SOUND
-            if (!gb.direct.frame_skip)
+#if AUDIO_DEBUG
+            /* Temporary: report the emulator's actual frame rate every ~5s.
+             * Audio is produced one batch per frame, so this is what decides
+             * whether the PWM output starves between batches. Uses its own
+             * counters so the 'b' serial benchmark still works independently. */
             {
+                static uint32_t fps_frames = 0;
+                static uint64_t fps_t0 = 0;
+
+                if (fps_t0 == 0)
+                    fps_t0 = time_us_64();
+
+                if (++fps_frames >= 300)
+                {
+                    uint64_t now = time_us_64();
+                    uint32_t diff = (uint32_t)(now - fps_t0);
+                    uint32_t accounted = lcd_xfer_us + block_dbg_us + pacer_dbg_us;
+
+                    DBG_INFO("FPS: %lu  frame=%lu  lcd=%lu  blk=%lu  pac=%lu  emu=%lu us\n",
+                             (uint32_t)(((uint64_t)fps_frames * 1000000u) / diff),
+                             diff / fps_frames,
+                             lcd_xfer_us / fps_frames,
+                             block_dbg_us / fps_frames,
+                             pacer_dbg_us / fps_frames,
+                             (diff > accounted ? diff - accounted : 0) / fps_frames);
+                    lcd_xfer_us = 0;
+                    block_dbg_us = 0;
+                    pacer_dbg_us = 0;
+                    fps_frames = 0;
+                    fps_t0 = now;
+                }
+            }
+#endif
+#if ENABLE_SOUND
+            /*
+             * Push every emulated frame. The APU advances with emulation, not
+             * with rendering, so frame_skip (which only halves how often the
+             * draw callback runs) must not gate audio — doing so is what made
+             * fast-forward silent.
+             *
+             * This blocks while core1 is behind, which is what keeps producer
+             * and consumer in step. The blocked time is accumulated so the rate
+             * estimate below can subtract it.
+             */
+            {
+#if ADAPTIVE_AUDIO_RATE
+                uint64_t push_t0 = time_us_64();
+#endif
                 multicore_fifo_push_blocking_inline(AUDIO_CMD_PLAYBACK);
+#if ADAPTIVE_AUDIO_RATE
+                uint32_t blocked = (uint32_t)(time_us_64() - push_t0);
+                audio_block_us += blocked;
+#if AUDIO_DEBUG
+                block_dbg_us += blocked;
+#endif
+#endif
+            }
+#endif
+
+#if ADAPTIVE_AUDIO_RATE
+            /*
+             * Measure how fast frames are actually produced and tell core1 to
+             * play back at that rate. AUDIO_SAMPLES samples are generated per
+             * emulated frame, so the true sample rate is AUDIO_SAMPLES times
+             * the real frame rate — not the nominal AUDIO_SAMPLE_RATE, which
+             * assumes 59.727 fps.
+             *
+             * Subtracting audio_block_us is what makes this converge. Measured
+             * wall-clock time includes any stall on the push above, so a
+             * too-low playback rate would slow core0, which would then measure
+             * a low production rate and confirm the too-low playback rate
+             * forever. Excluding that stall measures the rate core0 *could*
+             * sustain, letting the estimate climb back out. Pacer waits are
+             * deliberately not excluded — being throttled to real time is
+             * genuine frame spacing, not a measurement artefact.
+             */
+            {
+                static uint32_t rate_frames = 0;
+                static uint64_t rate_t0 = 0;
+                uint64_t now = time_us_64();
+
+                if (rate_t0 == 0)
+                {
+                    rate_t0 = now;
+                }
+                else if (++rate_frames >= 256)
+                {
+                    uint32_t window_us = (uint32_t)(now - rate_t0);
+
+                    if (window_us > audio_block_us)
+                        window_us -= audio_block_us;
+
+                    if (window_us > 0)
+                    {
+                        uint32_t rate = (uint32_t)(((uint64_t)rate_frames * AUDIO_SAMPLES *
+                                                    1000000u) / window_us);
+
+                        /* Shade 1% low so the pipeline settles into mild
+                         * back-pressure (inaudible) rather than mild
+                         * starvation (audible gaps). */
+                        rate -= rate / 100u;
+
+                        if (rate >= 8000u && rate <= 48000u)
+                            audio_target_rate = rate;
+                    }
+
+                    rate_frames = 0;
+                    rate_t0 = now;
+                    audio_block_us = 0;
+                }
             }
 #endif
             /* Update buttons state */

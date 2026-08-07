@@ -55,6 +55,7 @@ typedef struct i2s_config
 
 i2s_config_t i2s_get_default_config(void);
 void i2s_init(i2s_config_t *i2s_config);
+void i2s_set_sample_freq(i2s_config_t *i2s_config, uint32_t sample_freq);
 void i2s_write(const i2s_config_t *i2s_config,const int16_t *samples,const size_t len);
 void i2s_dma_write(i2s_config_t *i2s_config,const int16_t *samples);
 void i2s_volume(i2s_config_t *i2s_config,uint8_t volume);
