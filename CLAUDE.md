@@ -29,12 +29,37 @@ Binary type: `copy_to_ram` — all code executes from SRAM.
 
 ## Key Fixes Applied (vs upstream)
 
-### ROM loading from SD card
-**Problem:** After writing a ROM to flash, XIP cache served stale pre-write data. `flash_flush_cache()` is a no-op for the XIP cache on RP2350 (it only removes the QSPI CS force). `xip_cache_invalidate_all()` also did not reliably fix it.
+### ROM loading from SD card — it was QMI address translation, NOT the XIP cache
+This was misdiagnosed for a long time (and the wrong explanation cost three failed fix attempts).
+Reading the same byte after writing a ROM whose header byte `0x100` is `0x00`:
 
-**Fix (`load_cart_rom_file`):** During the flash write loop, simultaneously copy each sector's buffer directly into `rom_bank0`. After a successful load, `rom_bank0_ready = true` skips the `memcpy(rom_bank0, rom, ...)` in main — the data came from SD card and never touches the stale XIP cache.
+| alias | address | value |
+|---|---|---|
+| cached | `0x10000000` | `2C` |
+| nocache | `0x14000000` | `2C` |
+| **notrans** | **`0x1c000000`** | **`00`** |
+| direct SPI probe (0x03 cmd) | — | `00` |
 
-`flash_safe_execute` + `flash_safe_execute_core_init()` on core1 are used for multicore-safe flash writes.
+The write was always fine (erase reads `FF`, program reads back `00`) and the cache was never the
+problem — **RP2350's QMI address translation was remapping the reads**, which is why the non-cached
+alias behaved identically to the cached one and why invalidating anything made no difference.
+
+**Fix:** `rom` points at `XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE + FLASH_TARGET_OFFSET`
+(`0x1c000000`), the only alias that bypasses translation. It is also non-cached, so nothing can go
+stale either. Reads are slower than the cached view, but only bank-switched reads above 64KB take
+that path.
+
+**Consequence:** ROMs larger than 64KB used to execute garbage. `rom_bank0` (64KB in RAM, filled
+straight from the SD buffer during the write loop, `rom_bank0_ready = true`) is what made ROMs up to
+64KB work all along — it hid the bug rather than fixing it. Keep it: it is still the fast path.
+
+`load_cart_rom_file` also calls `flash_start_xip()` after the write loop, because
+`flash_range_erase`/`flash_range_program` call `flash_exit_xip()` on entry but never re-enter XIP;
+a flash-resident binary gets away with it, `copy_to_ram` does not.
+
+`ROM verify: N bytes OK` is logged on every load — a full byte-for-byte comparison of the source
+file against **both** sources `gb_rom_read` uses (`rom_bank0` below 64KB, flash above). Set
+`AUDIO_DEBUG 1` for the raw/alias probes and a `Cart:` line with the MBC state.
 
 ### LCD scanline flicker / jumpy row
 **Problem:** Earlier scanline rendering had two separate hazards:
@@ -116,7 +141,9 @@ with `snprintf` instead of `sprintf` (30 bytes worst case: `"gb/"` + 16 + `"_sta
 - `copy_to_ram` means all code runs from SRAM — `__no_inline_not_in_flash_func` still used for flash operation callbacks but is largely redundant
 - `PARAM_ASSERTIONS_DISABLE_ALL=1` — all SDK assertions disabled
 - `PICO_ENTER_USB_BOOT_ON_EXIT=1` — device enters BOOTSEL on firmware exit/crash
-- `xip_cache_invalidate_all()` is called before the game loop and before any resume-from-flash path, but its effectiveness on this hardware is unreliable for post-write cache invalidation — hence the SD-direct fill of `rom_bank0`
+- `xip_cache_invalidate_all()` is *not* unreliable — that was the old misdiagnosis. It is kept as
+  belt-and-braces, but `rom` reads through the non-cached NOTRANSLATE alias, so there is no cache in
+  front of ROM reads at all. See "ROM loading from SD card" above before touching any of this.
 - `ENABLE_DEBUG 1` is set — DBG_INFO outputs to USB serial. Do not add `stdio_flush()` in hot paths (update_lcd, draw line callbacks)
 - `lcd_draw_line_bis` is the active draw callback (registered via `gb_init_lcd`). `lcd_draw_line` exists but is not used.
 - `gb_init` bad-checksum diagnostic: if FSE=999 it means `flash_safe_execute` was never called — the ROM in flash was not updated this session. User pressed Start (resume path) instead of A/B (SD load path), or SD mount/open failed.
@@ -207,11 +234,16 @@ Diagnosing: `AUDIO_DEBUG 1` prints `peak` (0 = APU silent), `nr52` (bit 7 = powe
 (00 = master volume zero, the bug above).
 
 ## Known Issues
-- **ROM > 64KB will break.** `Flash verify ... MISMATCH` appears on every load: the XIP cache still
-  serves pre-write data, so `gb_rom_read`'s fallback to `rom[addr]` above 64KB reads stale bytes.
-  Games under 64KB work because `rom_bank0` is filled from the SD buffer.
-- `read_gb_emulator_state` overwrites the **whole** `struct gb_s`, including the callback pointers
-  (`gb_rom_read` is the first member) captured under a *different* firmware build. `gb_init_lcd`
-  repairs the draw callback; nothing repairs the other four.
+- **Bubble Bobble (MBC1, 128KB) boots and shows its intro, but resets back to the intro the moment
+  gameplay starts.** Everything on this side is cleared: `ROM verify: 131072 bytes OK`,
+  `Flash verify ... OK`, `Cart: type=01 romsz=02 ramsz=00 | mbc=1 cart_ram=0 rom_mask=0007` (all
+  correct for MBC1/8 banks), no `INVALID OPCODE` from `gb_error`, and `frame_skip` makes no
+  difference. Super Mario Land (64KB) works. Remaining suspects are peanut-gb's MBC1/timing
+  emulation or the ROM dump itself — next step is running the same file against a stock desktop
+  peanut-gb build (`ext/peanut-gb/examples/`).
+- `read_gb_emulator_state` overwrites the **whole** `struct gb_s`. The four callback pointers are
+  now re-installed after the restore (`gb_rom_read` is the first member, so a state file written by
+  a different build installs stale addresses and hangs on the first ROM read). Everything else in
+  the struct is still restored blind, including `direct.frame_skip`.
 - SRAM is nearly full: text 119832 + bss 362636 = 482468 of 520KB, ~50KB free. A second 184KB frame
   buffer (to overlap transfer with emulation, worth ~50 fps unskipped) does **not** fit.

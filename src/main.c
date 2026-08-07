@@ -143,7 +143,24 @@ struct minigb_apu_ctx apu_ctx = {0};
  */
 // #define FLASH_TARGET_OFFSET ((1024 * 1024) + (256 * 1024))
 #define FLASH_TARGET_OFFSET (1024 * 1024)
-const uint8_t *rom = (const uint8_t *)(XIP_BASE + FLASH_TARGET_OFFSET);
+/*
+ * Read the ROM through the NOTRANSLATE alias. Measured on hardware after
+ * writing a ROM whose header byte 0x100 is 0x00:
+ *
+ *   cached  (0x10000000) = 2C   nocache (0x14000000) = 2C
+ *   notrans (0x1c000000) = 00   direct-SPI probe     = 00
+ *
+ * So RP2350's QMI address translation was remapping our reads — this was never
+ * the XIP cache going stale (the long-standing explanation in this file's
+ * history) and never a failed write: erase reads FF, program reads back 00, and
+ * a raw 0x03-command probe finds correct data at both 0x100 and 0x10100.
+ *
+ * Only the NOTRANSLATE alias bypasses translation, and it is also non-cached,
+ * so nothing can go stale either. Addresses below 64KB never took this path —
+ * they come from rom_bank0, filled straight from the SD buffer — which is why
+ * ROMs up to 64KB always worked and anything banked above it executed garbage.
+ */
+const uint8_t *rom = (const uint8_t *)(XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE + FLASH_TARGET_OFFSET);
 static unsigned char rom_bank0[65536];
 
 static uint8_t ram[32768];
@@ -562,7 +579,10 @@ void read_gb_emulator_state(struct gb_s *gb)
     else
     {
         DBG_INFO("W read_gb_emulator_state(%s): SKIPPED (no previous state)\n", filename_state);
-        goto finish;
+        /* f_open failed, so there is nothing to close — falling through to
+         * finish: would call f_close on an invalid FIL (FR_INVALID_OBJECT). */
+        f_unmount(sd->pcName);
+        return;
     }
 
     DBG_INFO("I read_gb_emulator_state(%s) COMPLETED (%lu bytes)\n", filename_state, br);
@@ -643,6 +663,50 @@ static void __no_inline_not_in_flash_func(flash_raw_read_byte)(uint32_t addr, ui
     *out = rx[4];
 }
 
+#if AUDIO_DEBUG
+/* Ground truth: read a byte straight off the chip with a 0x03 command,
+ * bypassing XIP, its cache, and any QMI translation. This is what proved the
+ * QMI translation bug — see the alias table in CLAUDE.md. */
+static uint32_t   raw_probe_addr = 0;
+static uint8_t    raw_probe_val  = 0xFF;
+static void __no_inline_not_in_flash_func(do_flash_raw_probe)(void *arg)
+{
+    (void)arg;
+    flash_raw_read_byte(raw_probe_addr, &raw_probe_val);
+}
+
+static uint8_t flash_raw_probe(uint32_t addr)
+{
+    raw_probe_addr = addr;
+    raw_probe_val = 0xFF;
+    flash_safe_execute(do_flash_raw_probe, NULL, 5000);
+    return raw_probe_val;
+}
+#endif
+
+/*
+ * Re-initialise the XIP read path after programming.
+ *
+ * flash_range_erase()/flash_range_program() call flash_exit_xip() on entry but
+ * only flash_flush_cache() on exit — they never re-enter XIP (pico-sdk
+ * hardware_flash/flash.c). A flash-resident binary gets away with it; this one
+ * is copy_to_ram, so no code is fetched from flash and a broken XIP read path
+ * fails silently. Every read then returns pre-write data — through the cached
+ * *and* non-cached aliases alike — which is why "Flash verify ... MISMATCH" has
+ * always been logged while direct-SPI probes show the chip holding correct
+ * data. Invisible for ROMs under 64KB (served from rom_bank0), fatal above it.
+ *
+ * flash_start_xip() does the full connect / exit / flush / enter_cmd_xip
+ * sequence. It leaves XIP in the generic 03h serial read mode, which is slower
+ * than the boot-time configuration but correct, and only bank-switched reads
+ * above 64KB take that path.
+ */
+static void __no_inline_not_in_flash_func(do_flash_restart_xip)(void *arg)
+{
+    (void)arg;
+    flash_start_xip();
+}
+
 static void __no_inline_not_in_flash_func(do_flash_sector)(void *arg)
 {
     const flash_sector_args_t *a = (const flash_sector_args_t *)arg;
@@ -699,7 +763,7 @@ bool load_cart_rom_file(char *filename)
                          (rom_sd_computed_ck == rom_sd_stored_ck) ? "OK" : "MISMATCH");
                 /* snapshot flash before any write */
                 flash_flush_cache();
-                pre_write_hdr = ((const uint8_t *)(XIP_BASE + FLASH_TARGET_OFFSET))[0x100];
+                pre_write_hdr = rom[0x100];
                 DBG_INFO("Pre-write flash[100]=%02X\n", pre_write_hdr);
                 stdio_flush();
             }
@@ -731,8 +795,12 @@ bool load_cart_rom_file(char *filename)
         if (success) rom_bank0_ready = true;
         /* Verify header bytes in flash match what was read from SD */
         if (sector_num > 0) {
-            xip_cache_invalidate_all();  /* invalidate XIP cache — flash_flush_cache() is ROM-sequence only on RP2350 */
-            const uint8_t *xip_hdr = (const uint8_t *)(XIP_BASE + FLASH_TARGET_OFFSET);
+            /* Restore the XIP read path the flash writes tore down, then drop
+             * anything the cache retained from before it worked. */
+            flash_safe_execute(do_flash_restart_xip, NULL, 5000);
+            xip_cache_invalidate_all();
+
+            const uint8_t *xip_hdr = rom;
             rom_sd_hdr_byte      = xip_hdr[0x100]; /* reuse globals: now holds post-write XIP values */
             rom_sd_stored_ck     = xip_hdr[0x14D];
             uint8_t ck = 0;
@@ -742,9 +810,86 @@ bool load_cart_rom_file(char *filename)
             DBG_INFO("Flash verify: hdr[100]=%02X ck=%02X/%02X %s\n",
                      xip_hdr[0x100], ck, xip_hdr[0x14D],
                      (ck == xip_hdr[0x14D]) ? "OK" : "MISMATCH"); stdio_flush();
+
+            /* Compare the XIP view against the chip itself. s0 raw values are
+             * captured inside do_flash_sector immediately after erase (expect
+             * FF) and after program (expect the SD byte). low/high are fresh
+             * probes at the start of the ROM and inside bank 4 (>64KB, the
+             * region rom_bank0 does not cover and banked games actually run
+             * from). Disagreement between raw and XIP means the read path is at
+             * fault; agreement on the pre-write value means the write is. */
+#if AUDIO_DEBUG
+            DBG_INFO("Raw: er=%02X pr=%02X low=%02X high=%02X | SD=%02X XIP=%02X\n",
+                     post_erase_raw, post_prog_raw,
+                     flash_raw_probe(FLASH_TARGET_OFFSET + 0x100),
+                     flash_raw_probe(FLASH_TARGET_OFFSET + 0x10100),
+                     rom_buf_hdr_byte, xip_hdr[0x100]); stdio_flush();
+
+            /*
+             * Same byte through every XIP alias, against the chip itself.
+             * volatile so none of these can be folded into a single load.
+             *   cached  0x10000000 — normal view
+             *   nocache 0x14000000 — bypasses the XIP cache
+             *   notrans 0x1c000000 — also bypasses QMI address translation
+             * If notrans alone matches raw, translation is remapping our reads.
+             * If none match raw, the fault is below all of them.
+             */
+            {
+                const volatile uint8_t *a_cached =
+                    (const volatile uint8_t *)(XIP_BASE + FLASH_TARGET_OFFSET);
+                const volatile uint8_t *a_nocache =
+                    (const volatile uint8_t *)(XIP_NOCACHE_NOALLOC_BASE + FLASH_TARGET_OFFSET);
+                const volatile uint8_t *a_notrans =
+                    (const volatile uint8_t *)(XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE + FLASH_TARGET_OFFSET);
+
+                DBG_INFO("Alias: cached=%02X nocache=%02X notrans=%02X | raw=%02X SD=%02X\n",
+                         a_cached[0x100], a_nocache[0x100], a_notrans[0x100],
+                         flash_raw_probe(FLASH_TARGET_OFFSET + 0x100),
+                         rom_buf_hdr_byte); stdio_flush();
+            }
+#endif
         }
         DBG_INFO("I load_cart_rom_file(%s) %s (%lu sectors, fse=%d)\n",
                  filename, success ? "OK" : "FAIL", sector_num, last_fse_ret); stdio_flush();
+
+        /* Full byte-for-byte check of flash against the source file. The header
+         * spot-check only proves sector 0; a banked game reads all of it. */
+        if (success && f_lseek(&fil, 0) == FR_OK)
+        {
+            uint32_t off = 0, bad = 0;
+            uint32_t first_bad = 0xFFFFFFFF;
+
+            for (;;)
+            {
+                if (f_read(&fil, buffer, sizeof buffer, &br) != FR_OK || br == 0)
+                    break;
+
+                for (UINT i = 0; i < br; i++)
+                {
+                    /* Check both sources gb_rom_read() uses: rom_bank0 (RAM,
+                     * filled from the SD buffer) below 64KB, flash above it. */
+                    uint8_t got = (off + i) < sizeof(rom_bank0)
+                                      ? rom_bank0[off + i]
+                                      : rom[off + i];
+
+                    if (got != buffer[i])
+                    {
+                        if (first_bad == 0xFFFFFFFF)
+                            first_bad = off + i;
+                        bad++;
+                    }
+                }
+                off += br;
+            }
+
+            if (bad == 0)
+                DBG_INFO("ROM verify: %lu bytes OK\n", off);
+            else
+                DBG_INFO("ROM verify: %lu of %lu bytes differ, first at 0x%lX (flash=%02X file=%02X)\n",
+                         bad, off, first_bad, rom[first_bad],
+                         (unsigned)(first_bad < sizeof(rom_bank0) ? rom_bank0[first_bad] : 0));
+            stdio_flush();
+        }
 
         f_close(&fil);
     }
@@ -1161,6 +1306,21 @@ int main(void)
                       &gb_cart_ram_write, &gb_error, NULL);
         DBG_INFO("GB ");
 
+#if AUDIO_DEBUG
+        /* Cartridge hardware as declared by the header vs. what gb_init made of
+         * it. A wrong num_rom_banks_mask silently truncates bank switches, which
+         * lands the CPU in the wrong bank — the classic "game resets itself"
+         * symptom, with no invalid opcode because the wrong bank is still valid
+         * code. header: 0x147 type, 0x148 rom size, 0x149 ram size. */
+        DBG_INFO("Cart: type=%02X romsz=%02X ramsz=%02X | mbc=%d cart_ram=%d "
+                 "rom_mask=%04X ram_banks=%d save=%lu\n",
+                 rom_bank0[0x147], rom_bank0[0x148], rom_bank0[0x149],
+                 (int)gb.mbc, (int)gb.cart_ram,
+                 (unsigned)gb.num_rom_banks_mask, (int)gb.num_ram_banks,
+                 (unsigned long)gb_get_save_size(&gb));
+        stdio_flush();
+#endif
+
         if (ret != GB_INIT_NO_ERROR)
         {
             /* Compute what gb_init saw so user can diagnose without USB */
@@ -1209,6 +1369,20 @@ int main(void)
 #if ENABLE_SDCARD
         /* Try to load last saved emulator state for this game. */
         read_gb_emulator_state(&gb);
+
+        /*
+         * Re-install the callbacks. read_gb_emulator_state() overwrites the
+         * whole struct gb_s, and the function pointers are its first members —
+         * so a state file restores addresses captured under whatever firmware
+         * build saved it. Any rebuild moves those addresses, and calling
+         * through a stale gb_rom_read hangs on the first ROM access, which
+         * looks like a freeze at startup. gb_init_lcd() below happens to repair
+         * display.lcd_draw_line; nothing repaired these four.
+         */
+        gb.gb_rom_read = &gb_rom_read;
+        gb.gb_cart_ram_read = &gb_cart_ram_read;
+        gb.gb_cart_ram_write = &gb_cart_ram_write;
+        gb.gb_error = &gb_error;
 #endif
 
         /* Automatically assign a colour palette to the game */
