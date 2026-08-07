@@ -392,16 +392,40 @@ void lcd_draw_line_bis(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
 #endif
 
 #if ENABLE_SDCARD
+
+/* Subdirectory searched for rom files; the card root is used as a fallback */
+#define ROM_DIR "gb"
+
+/**
+ * Directory holding save files and emulator states, as a prefix ending in '/'
+ * ("" means the card root). The rom selector points this at the directory it
+ * listed roms from, so saves sit next to the rom they belong to. The
+ * resume-from-flash path (Start) keeps whatever that scan chose.
+ */
+static const char *save_dir_prefix = "";
+
+/**
+ * Build the save file path for the currently loaded rom. The name comes from
+ * the cartridge header title, so it is independent of the rom's file name.
+ */
+static void gb_save_path(struct gb_s *gb, const char *suffix, char *out, size_t out_size)
+{
+    char title[17]; /* header title is 16 bytes (0x134..0x143) plus terminator */
+
+    gb_get_rom_name(gb, title);
+    snprintf(out, out_size, "%s%s%s", save_dir_prefix, title, suffix);
+}
+
 /**
  * Load a save file from the SD card
  */
 void read_cart_ram_file(struct gb_s *gb)
 {
-    char filename[16];
+    char filename[48];
     uint_fast32_t save_size;
     UINT br;
 
-    gb_get_rom_name(gb, filename);
+    gb_save_path(gb, "", filename, sizeof filename);
     save_size = gb_get_save_size(gb);
     if (save_size > 0)
     {
@@ -443,11 +467,11 @@ void read_cart_ram_file(struct gb_s *gb)
  */
 void write_cart_ram_file(struct gb_s *gb)
 {
-    char filename[16];
+    char filename[48];
     uint_fast32_t save_size;
     UINT bw;
 
-    gb_get_rom_name(gb, filename);
+    gb_save_path(gb, "", filename, sizeof filename);
     save_size = gb_get_save_size(gb);
     if (save_size > 0)
     {
@@ -488,16 +512,14 @@ void write_cart_ram_file(struct gb_s *gb)
  */
 void read_gb_emulator_state(struct gb_s *gb)
 {
-    char filename[16];
-    char filename_state[32];
+    char filename_state[48];
     UINT br = 0;
     FIL fil;
 
     sd_card_t *sd = sd_get_by_num(0);
     FRESULT fr = f_mount(&sd->fatfs, sd->pcName, 1);
 
-    gb_get_rom_name(gb, filename);
-    sprintf(filename_state, "%s_state.bin", filename);
+    gb_save_path(gb, "_state.bin", filename_state, sizeof filename_state);
     fr = f_open(&fil, filename_state, FA_READ);
 
     if (fr == FR_OK)
@@ -528,16 +550,14 @@ finish:
  */
 void write_gb_emulator_state(struct gb_s *gb)
 {
-    char filename[16];
-    char filename_state[32];
+    char filename_state[48];
     UINT bw;
     FIL fil;
 
     sd_card_t *sd = sd_get_by_num(0);
     FRESULT fr = f_mount(&sd->fatfs, sd->pcName, 1);
 
-    gb_get_rom_name(gb, filename);
-    sprintf(filename_state, "%s_state.bin", filename);
+    gb_save_path(gb, "_state.bin", filename_state, sizeof filename_state);
     fr = f_open(&fil, filename_state, FA_CREATE_ALWAYS | FA_WRITE);
 
     if (fr == FR_OK)
@@ -550,7 +570,7 @@ void write_gb_emulator_state(struct gb_s *gb)
         goto finish;
     }
 
-    DBG_INFO("I write_gb_emulator_state(%s) COMPLETED (%lu bytes)\n", filename, bw);
+    DBG_INFO("I write_gb_emulator_state(%s) COMPLETED (%lu bytes)\n", filename_state, bw);
 
 finish:
     fr = f_close(&fil);
@@ -705,6 +725,37 @@ bool load_cart_rom_file(char *filename)
 }
 
 /**
+ * Start a rom search in ROM_DIR, falling back to the card root when that
+ * directory is missing or holds no rom files. On return *prefix is the string
+ * to prepend to fno->fname to obtain a path usable with f_open().
+ */
+static FRESULT rom_dir_findfirst(DIR *dj, FILINFO *fno, const char **prefix)
+{
+    FRESULT fr = f_findfirst(dj, fno, ROM_DIR, "?*.gb");
+    if (fr == FR_OK && fno->fname[0])
+    {
+        *prefix = ROM_DIR "/";
+        return fr;
+    }
+
+    if (fr == FR_OK)
+        f_closedir(dj); /* directory exists but contains no roms */
+
+    DBG_INFO("Selector: no roms in %s/ (fr=%d), using card root\n", ROM_DIR, fr);
+    *prefix = "";
+    return f_findfirst(dj, fno, ".", "?*.gb");
+}
+
+/**
+ * Return the file name part of a rom path stored by the selector
+ */
+static const char *rom_basename(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+/**
  * Function used by the rom file selector to display one page of .gb rom files
  */
 uint16_t rom_file_selector_display_page(char filename[22][256], uint16_t num_page)
@@ -727,9 +778,13 @@ uint16_t rom_file_selector_display_page(char filename[22][256], uint16_t num_pag
         strcpy(filename[ifile], "");
     }
 
-    /* search *.gb files */
+    /* search *.gb files in ROM_DIR, falling back to the card root */
     uint16_t num_file = 0;
-    fr = f_findfirst(&dj, &fno, ".", "?*.gb");
+    const char *prefix = "";
+    fr = rom_dir_findfirst(&dj, &fno, &prefix);
+
+    /* keep saves and states in the directory the roms were listed from */
+    save_dir_prefix = prefix;
 
     /* skip the first N pages */
     if (num_page > 0)
@@ -748,7 +803,7 @@ uint16_t rom_file_selector_display_page(char filename[22][256], uint16_t num_pag
         if (fno.fname[0] != '.')
         {
             /* Skip any file starting with dot. These are hidden files. */
-            strcpy(filename[num_file], fno.fname);
+            snprintf(filename[num_file], 256, "%s%s", prefix, fno.fname);
             num_file++;
         }
 
@@ -762,7 +817,7 @@ uint16_t rom_file_selector_display_page(char filename[22][256], uint16_t num_pag
     for (uint8_t ifile = 0; ifile < num_file; ifile++)
     {
         DBG_INFO("Game: %s\n", filename[ifile]);
-        draw_string(20, ifile * 20, filename[ifile]);
+        draw_string(20, ifile * 20, rom_basename(filename[ifile]));
     }
     DBG_INFO("DP: update_lcd\n"); stdio_flush();
     update_lcd();
@@ -773,7 +828,8 @@ uint16_t rom_file_selector_display_page(char filename[22][256], uint16_t num_pag
 /**
  * The ROM selector displays pages of up to 22 rom files
  * allowing the user to select which rom file to start
- * Copy your *.gb rom files to the root directory of the SD card
+ * Copy your *.gb rom files to the "gb" directory of the SD card
+ * (the root directory is used when that directory holds no roms)
  */
 void rom_file_selector()
 {
@@ -807,7 +863,7 @@ void rom_file_selector()
         case KEY_A:
         case KEY_B:
             rom_file_selector_display_page(filename, num_page);
-            snprintf(buf, sizeof(buf), "Loading %s", filename[selected]);
+            snprintf(buf, sizeof(buf), "Loading %s", rom_basename(filename[selected]));
             draw_string(0, FRAME_BUFF_HEIGHT - 20, buf);
             DBG_INFO("A: update_lcd\n"); stdio_flush();
             update_lcd();

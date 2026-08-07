@@ -10,7 +10,7 @@ Forked from TheKiwil/PocketPico which is itself a fork of slintak/PocketPico (or
 - **MCU:** RP2350 (Pico 2), dual Cortex-M33, overclocked to 300 MHz
 - **Display:** ILI9488 3.5" LCD, physical 320×480, driven via PIO0 + DMA. `WIDTH=320, HEIGHT=320` in code — only the first 320 rows are used. Game image (2× scaled: 320×288) is centered vertically with 16-pixel margins top and bottom.
 - **Keyboard:** I2C keyboard (PicoCalc QWERTY), polled via hardware alarm 0 (`TIMER0_IRQ_0`). Timer fires every 1ms (`TICKSPERSEC=1000µs`); I2C read/write done every 16ms (`KEYCHECKTIME=16`).
-- **SD card:** SPI0 (GPIO 16–19), FatFS, stores `.gb` ROM files and save states
+- **SD card:** SPI0 (GPIO 16–19), FatFS, stores `.gb` ROM files and save states (in `gb/`, see ROM Loading Workflow)
 - **Audio:** I2S via PIO1, GPIO 26 (data) / 27 (BCLK) / 28 (LRCLK), 32768 Hz stereo
 - **Flash:** W25Q series, 1MB firmware + ROM stored at `FLASH_TARGET_OFFSET = 0x100000` (1MB offset)
 
@@ -57,10 +57,46 @@ The original I2C timeout was 500ms per operation; the 1ms interrupt fired every 
 Added `flash_safe_execute_core_init()` at the start of `core1_audio` so core0 can safely lock out core1 during flash operations.
 
 ## ROM Loading Workflow
-1. Copy `.gb` files to the root of a FAT32 micro SD card
+1. Copy `.gb` files to the `gb/` folder of a FAT32 micro SD card (the card root is used as a fallback, see below)
 2. Power on → file selector appears
 3. Select ROM with **A or B** → "Loading..." → ROM written to flash, `rom_bank0` filled from SD buffer → game starts
 4. **Start** in selector currently attempts to resume from flash directly (skips `load_cart_rom_file`) — unreliable because XIP cache invalidation is not reliable on RP2350. **TODO:** make Start behave like A/B (load from SD).
+
+### ROM directory and save location (`ROM_DIR "gb"`)
+`rom_dir_findfirst` searches `gb/` first and falls back to the card root when that directory is
+missing **or** contains no `.gb` files (so an empty `gb/` does not strand the user on a blank menu).
+Both locations are never merged — it is `gb/` *or* the root, whichever wins. The selector stores the
+full relative path (`gb/Tetris.gb`) so `load_cart_rom_file`'s `f_open` resolves it unchanged;
+`rom_basename()` strips the directory for on-screen display and the "Loading %s" line.
+
+Saves follow the ROM directory: `save_dir_prefix` is set by `rom_file_selector_display_page` to the
+prefix the scan chose (`"gb/"` or `""`), and all four save functions build their path through
+`gb_save_path()`. This also covers the Start/resume path, which selects no individual file.
+
+| What | With ROMs in `gb/` | Root fallback |
+|---|---|---|
+| Battery RAM save | `gb/TETRIS` (no extension) | `TETRIS` |
+| Emulator state | `gb/TETRIS_state.bin` | `TETRIS_state.bin` |
+
+The save name is the **cartridge header title** (ROM bytes `0x134`–`0x143`) from `gb_get_rom_name()`,
+not the file name — renaming a `.gb` does not orphan its save, and two ROMs sharing a header title
+(e.g. a ROM and its patched variant) overwrite each other's saves.
+
+Hardware-validated. Migration for existing cards: move the `*_state.bin` files **and** the
+extension-less RAM saves into `gb/`.
+
+**Key files:**
+- `src/main.c:397` — `ROM_DIR` definition
+- `src/main.c:405-418` — `save_dir_prefix` and `gb_save_path()`
+- `src/main.c:732` — `rom_dir_findfirst()` (subfolder search with root fallback)
+- `src/main.c:752` — `rom_basename()` (display-only path stripping)
+- `src/main.c:787` — selector points `save_dir_prefix` at the scanned directory
+
+### Header-title buffer fix
+`gb_get_rom_name()` copies up to 16 printable chars from the header then appends `'\0'`, but the four
+save functions passed a `char[16]` — a full 16-character title overflowed the stack buffer by one
+byte. `gb_save_path()` now uses `char title[17]`, and the composed paths are 48-byte buffers built
+with `snprintf` instead of `sprintf` (30 bytes worst case: `"gb/"` + 16 + `"_state.bin"` + NUL).
 
 ## Gotchas
 - `copy_to_ram` means all code runs from SRAM — `__no_inline_not_in_flash_func` still used for flash operation callbacks but is largely redundant
