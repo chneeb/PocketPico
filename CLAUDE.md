@@ -235,12 +235,25 @@ Diagnosing: `AUDIO_DEBUG 1` prints `peak` (0 = APU silent), `nr52` (bit 7 = powe
 
 ## Known Issues
 - **Bubble Bobble (MBC1, 128KB) boots and shows its intro, but resets back to the intro the moment
-  gameplay starts.** Everything on this side is cleared: `ROM verify: 131072 bytes OK`,
-  `Flash verify ... OK`, `Cart: type=01 romsz=02 ramsz=00 | mbc=1 cart_ram=0 rom_mask=0007` (all
-  correct for MBC1/8 banks), no `INVALID OPCODE` from `gb_error`, and `frame_skip` makes no
-  difference. Super Mario Land (64KB) works. Remaining suspects are peanut-gb's MBC1/timing
-  emulation or the ROM dump itself — next step is running the same file against a stock desktop
-  peanut-gb build (`ext/peanut-gb/examples/`).
+  gameplay starts.** Still fails on the post-translation-fix build, with `ROM verify: 131072 bytes
+  OK`. Do not re-investigate the storage or read path — it is fully excluded. Already ruled out:
+  - `ROM verify: 131072 bytes OK` — flash *and* `rom_bank0` match the source file byte for byte
+  - `Flash verify ... OK`, raw 0x03-command probes correct at `0x100` and `0x10100`
+  - `Cart: type=01 romsz=02 ramsz=00 | mbc=1 cart_ram=0 rom_mask=0007` — correct for MBC1/8 banks,
+    so bank switches are not being truncated
+  - no `INVALID OPCODE` (or any `gb_error`) is raised — the CPU is running valid code
+  - `frame_skip` on or off makes no difference; no save state involved (`SKIPPED`)
+  - Super Mario Land (64KB) works, including after deleting its state file
+
+  Remaining suspects are peanut-gb's MBC1/timing emulation or the ROM dump itself. Two cheap next
+  steps, both needing the file copied off the SD card:
+  1. **Verify the global cartridge checksum** (`0x14E-0x14F`, big-endian sum of every other byte).
+     peanut-gb only checks the *header* checksum at `0x14D`, which passes as `B1/B1` — a truncated
+     or corrupt dump typically still passes that one and fails the global. `ROM verify` only proves
+     flash matches the file; it cannot tell whether the file itself is good.
+  2. **Run it against upstream peanut-gb headless** — `ext/peanut-gb/examples/benchmark` has no SDL
+     dependency (`debug` and `sdl2` do). Same core, no flash/XIP/porting involved, so a failure
+     there clears this port entirely.
 - `read_gb_emulator_state` overwrites the **whole** `struct gb_s`. The four callback pointers are
   now re-installed after the restore (`gb_rom_read` is the first member, so a state file written by
   a different build installs stale addresses and hangs on the first ROM read). Everything else in
